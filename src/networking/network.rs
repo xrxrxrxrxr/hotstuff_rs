@@ -1,3 +1,4 @@
+// hotstuff_rs/src/networking/network.rs
 //! Trait for pluggable peer-to-peer (P2P) networking.
 //!
 //! Main trait: [`Network`].

@@ -144,20 +144,50 @@ pub trait KVGet {
         }
     }
 
+    // fn block_data(&self, block: &CryptoHash) -> Result<Option<Data>, KVGetError> {
+    //     let data_len = self.block_data_len(block)?;
+    //     match data_len {
+    //         None => Ok(None),
+    //         Some(len) => {
+    //             let mut data = (0..len.int()).map(|i| self.block_datum(block, i));
+    //             if let None = data.find(|datum| datum.is_none()) {
+    //                 Ok(Some(Data::new(data.map(|datum| datum.unwrap()).collect())))
+    //             } else {
+    //                 Err(KVGetError::ValueExpectedButNotFound {
+    //                     key: Key::BlockData {
+    //                         block: block.clone(),
+    //                     },
+    //                 })
+    //             }
+    //         }
+    //     }
+    // }
+
+    // Revised block_data method to handle None values more gracefully
     fn block_data(&self, block: &CryptoHash) -> Result<Option<Data>, KVGetError> {
         let data_len = self.block_data_len(block)?;
         match data_len {
             None => Ok(None),
             Some(len) => {
-                let mut data = (0..len.int()).map(|i| self.block_datum(block, i));
-                if let None = data.find(|datum| datum.is_none()) {
-                    Ok(Some(Data::new(data.map(|datum| datum.unwrap()).collect())))
-                } else {
+                // 修复方案1：先收集所有数据，再检查
+                let data_vec: Vec<Option<Datum>> = (0..len.int())
+                    .map(|i| self.block_datum(block, i))
+                    .collect();
+                
+                // 检查是否有任何 None
+                if data_vec.iter().any(|datum| datum.is_none()) {
                     Err(KVGetError::ValueExpectedButNotFound {
                         key: Key::BlockData {
                             block: block.clone(),
                         },
                     })
+                } else {
+                    // 所有数据都存在，安全地解包
+                    let unwrapped_data: Vec<Datum> = data_vec
+                        .into_iter()
+                        .map(|datum| datum.unwrap())
+                        .collect();
+                    Ok(Some(Data::new(unwrapped_data)))
                 }
             }
         }

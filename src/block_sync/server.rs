@@ -57,6 +57,7 @@ pub struct BlockSyncServer<N: Network + 'static, K: KVStore> {
     config: BlockSyncServerConfiguration,
     block_tree_camera: BlockTreeCamera<K>,
     last_advertisement: Instant,
+    last_advertised_highest_pc_view: Option<crate::types::data_types::ViewNumber>,
     receiver: BlockSyncServerStub,
     sender: SenderHandle<N>,
     shutdown_signal: Receiver<()>,
@@ -72,10 +73,18 @@ impl<N: Network + 'static, K: KVStore> BlockSyncServer<N, K> {
         shutdown_signal: Receiver<()>,
         event_publisher: Option<Sender<Event>>,
     ) -> Self {
+        // Initialize last_advertised_highest_pc_view with the current snapshot's highest PC view, if available.
+        let initial_pc_view = block_tree_camera
+            .snapshot()
+            .highest_pc()
+            .ok()
+            .map(|pc| pc.view);
+
         Self {
             config,
             block_tree_camera,
             last_advertisement: Instant::now(),
+            last_advertised_highest_pc_view: initial_pc_view,
             receiver: BlockSyncServerStub::new(requests),
             sender: SenderHandle::new(network),
             shutdown_signal,
@@ -149,7 +158,44 @@ impl<N: Network + 'static, K: KVStore> BlockSyncServer<N, K> {
                 }
             }
 
-            // 2. If the last advertisement was sent more than `advertise_time` duration ago, broadcast an:
+            // 2a. If our HighestPC advanced since the last advertisement, immediately broadcast an AdvertisePC
+            //     and AdvertiseBlock to accelerate catch-up for lagging peers.
+            {
+                if let Ok(cur_highest_pc) = self.block_tree_camera.snapshot().highest_pc() {
+                    let should_advertise_immediately = match self.last_advertised_highest_pc_view {
+                        Some(prev) => cur_highest_pc.view > prev,
+                        None => true,
+                    };
+                    if should_advertise_immediately {
+                        let highest_committed_block_height = match self
+                            .block_tree_camera
+                            .snapshot()
+                            .highest_committed_block_height()
+                            .expect("Could not obtain the highest committed block height!")
+                        {
+                            Some(height) => height,
+                            None => BlockHeight::new(0),
+                        };
+
+                        // Broadcast an Advertise PC message.
+                        let advertise_pc_msg = BlockSyncAdvertiseMessage::advertise_pc(cur_highest_pc.clone());
+                        self.sender.broadcast(advertise_pc_msg);
+
+                        // Broadcast an Advertise Block message.
+                        let advertise_block_msg = BlockSyncAdvertiseMessage::advertise_block(
+                            &self.config.keypair,
+                            self.config.chain_id,
+                            highest_committed_block_height,
+                        );
+                        self.sender.broadcast(advertise_block_msg);
+
+                        self.last_advertised_highest_pc_view = Some(cur_highest_pc.view);
+                        self.last_advertisement = Instant::now();
+                    }
+                }
+            }
+
+            // 2b. If the last advertisement was sent more than `advertise_time` duration ago, broadcast an:
             // - Advertise PC: to let others know about our local Highest PC, which may trigger them to start
             //   syncing if they find that they are behind.
             // - Advertise Block: to let others know about our local Highest Committed Block height, so that they

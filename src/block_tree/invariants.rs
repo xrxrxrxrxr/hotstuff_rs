@@ -309,6 +309,8 @@ use super::{
     pluggables::KVStore,
 };
 
+use log::{error, info, warn};
+
 /// Check whether `block` can safely cause updates to `block_tree`, given the replica's `chain_id`.
 ///
 /// # Conditional checks
@@ -325,11 +327,33 @@ pub(crate) fn safe_block<K: KVStore>(
     block_tree: &BlockTreeSingleton<K>,
     chain_id: ChainID,
 ) -> Result<bool, BlockTreeError> {
-    Ok(
-        /* 1 */
-        safe_pc(&block.justify, block_tree, chain_id)? &&
-        /* 2 */ block.justify.is_block_justify(),
-    )
+    // 条件1：区块的 justify 是否安全
+    let cond1 = safe_pc(&block.justify, block_tree, chain_id)?;
+    // 条件2：justify 阶段是否为可用于区块的阶段
+    let cond2 = block.justify.is_block_justify();
+
+    let ok = cond1 && cond2;
+    if !ok {
+        let height = block_tree.block_height(&block.hash).ok().flatten();
+        let highest_pc = block_tree.highest_pc()?;
+        let locked_pc = block_tree.locked_pc()?;
+        warn!(
+            "SAFE_BLOCK_FAIL: block={} height={:?} | cond1(safe_pc)={} | cond2(is_block_justify)={} (justify.phase={:?}) | justify.block={} justify.view={} | highest_pc.block={} highest_pc.view={} | locked.block={} locked.view={}",
+            block.hash,
+            height.map(|h| h.int()),
+            cond1,
+            cond2,
+            block.justify.phase,
+            block.justify.block,
+            block.justify.view.int(),
+            highest_pc.block,
+            highest_pc.view.int(),
+            locked_pc.block,
+            locked_pc.view.int(),
+        );
+    }
+
+    Ok(ok)
 }
 
 /// Check whether `pc` can safely cause updates to `block_tree`, given the replica's `chain_id`.
@@ -353,15 +377,59 @@ pub(crate) fn safe_pc<K: KVStore>(
     block_tree: &BlockTreeSingleton<K>,
     chain_id: ChainID,
 ) -> Result<bool, BlockTreeError> {
-    Ok(
-        /* 1 */
-        (pc.chain_id == chain_id || pc.is_genesis_pc()) &&
-        /* 2 */ (block_tree.contains(&pc.block) || pc.is_genesis_pc()) &&
-        /* 3 */ (pc.view > block_tree.locked_pc()?.view || extends_locked_pc_block(pc, block_tree)?) &&
-        /* 4 */ (((pc.phase.is_prepare() || pc.phase.is_precommit() || pc.phase.is_commit() || pc.phase.is_decide()) &&
-                   block_tree.validator_set_updates_status(&pc.block)?.contains_updates()) ||
-        /* 4 (else) */ (pc.phase.is_generic() && !block_tree.validator_set_updates_status(&pc.block)?.contains_updates())),
-    )
+    // 条件1：链ID一致或为创世
+    let cond1 = pc.chain_id == chain_id || pc.is_genesis_pc();
+
+    // 条件2：区块存在或为创世
+    let block_exists = block_tree.contains(&pc.block);
+    let cond2 = block_exists || pc.is_genesis_pc();
+
+    // 条件3：视图高于锁定视图，或在锁定分支上
+    let locked_pc = block_tree.locked_pc()?;
+    let view_check = pc.view > locked_pc.view;
+    let extends_check = if !view_check {
+        extends_locked_pc_block(pc, block_tree)?
+    } else {
+        false
+    };
+    let cond3 = view_check || extends_check;
+
+    // 条件4：阶段与是否为验证者集合更新匹配
+    let vs_status = block_tree.validator_set_updates_status(&pc.block)?;
+    let has_updates = vs_status.contains_updates();
+    let phase_is_special =
+        pc.phase.is_prepare() || pc.phase.is_precommit() || pc.phase.is_commit() || pc.phase.is_decide();
+    let cond4 = (phase_is_special && has_updates) || (pc.phase.is_generic() && !has_updates);
+
+    let ok = cond1 && cond2 && cond3 && cond4;
+
+    if !ok {
+        let highest_pc = block_tree.highest_pc()?;
+        warn!(
+            "SAFE_PC_FAIL: pc.block={} view={} phase={:?} | cond1(chain_id/genesis)={} (pc.chain_id={}, my.chain_id={}) | cond2(block_exists/genesis)={} (exists={}) | cond3(view>locked || extends)={} (pc.view={}, locked.view={}, extends={}) | cond4(phase/updates)={} (phase_special={}, has_updates={}) | highest_pc.block={} highest_pc.view={} locked.block={} locked.view={}",
+            pc.block,
+            pc.view.int(),
+            pc.phase,
+            cond1,
+            pc.chain_id.int(),
+            chain_id.int(),
+            cond2,
+            block_exists,
+            cond3,
+            pc.view.int(),
+            locked_pc.view.int(),
+            extends_check,
+            cond4,
+            phase_is_special,
+            has_updates,
+            highest_pc.block,
+            highest_pc.view.int(),
+            locked_pc.block,
+            locked_pc.view.int(),
+        );
+    }
+
+    Ok(ok)
 }
 
 /// Check whether `nudge` can safely cause updates to `block_tree`, given the replica's `current_view`
@@ -384,13 +452,38 @@ pub fn safe_nudge<K: KVStore>(
     block_tree: &BlockTreeSingleton<K>,
     chain_id: ChainID,
 ) -> Result<bool, BlockTreeError> {
-    Ok(
-        /* 1 */
-        safe_pc(&nudge.justify, block_tree, chain_id)? &&
-        /* 2 */ nudge.justify.is_nudge_justify() &&
-        /* 3 */ (nudge.chain_id == chain_id) &&
-        /* 4 */ (nudge.justify.phase.is_commit() || nudge.justify.view == current_view - 1),
-    )
+    // 条件1：justify 满足 safe_pc
+    let cond1 = safe_pc(&nudge.justify, block_tree, chain_id)?;
+    // 条件2：阶段允许作为 nudge 的 justify
+    let cond2 = nudge.justify.is_nudge_justify();
+    // 条件3：链ID匹配
+    let cond3 = nudge.chain_id == chain_id;
+    // 条件4：要么是 Commit，要么 justify.view == current_view - 1
+    let cond4 = nudge.justify.phase.is_commit() || nudge.justify.view == current_view - 1;
+
+    let ok = cond1 && cond2 && cond3 && cond4;
+    if !ok {
+        let highest_pc = block_tree.highest_pc()?;
+        let locked_pc = block_tree.locked_pc()?;
+        warn!(
+            "SAFE_NUDGE_FAIL: view={} nudge.chain_id={} | cond1(safe_pc)={} | cond2(is_nudge_justify)={} (justify.phase={:?}) | cond3(chain_id_match)={} | cond4(commit_or_prev_view)={} (justify.view={}, current_view={}) | highest_pc.block={} highest_pc.view={} | locked.block={} locked.view={}",
+            current_view.int(),
+            nudge.chain_id.int(),
+            cond1,
+            cond2,
+            nudge.justify.phase,
+            cond3,
+            cond4,
+            nudge.justify.view.int(),
+            current_view.int(),
+            highest_pc.block,
+            highest_pc.view.int(),
+            locked_pc.block,
+            locked_pc.view.int(),
+        );
+    }
+
+    Ok(ok)
 }
 
 /// Get the PC (if any) that should be set as the Locked PC after the replica sees the given `justify`.

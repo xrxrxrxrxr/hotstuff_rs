@@ -7,11 +7,12 @@
 //! [Pacemaker](crate::pacemaker), and [BlockSync](crate::block_sync) subprotocols.
 
 use std::{
-    sync::mpsc::{Receiver, Sender, TryRecvError},
+    sync::mpsc::{Receiver, Sender, TryRecvError, self},
     thread::{self, JoinHandle},
 };
 
 use ed25519_dalek::VerifyingKey;
+use log::info;
 
 use crate::{
     app::App,
@@ -43,6 +44,7 @@ pub(crate) struct Algorithm<N: Network + 'static, K: KVStore, A: App<K> + 'stati
     hotstuff: HotStuff<N>,
     pacemaker: Pacemaker<N>,
     block_sync_client: BlockSyncClient<N>,
+    sync_hint_rx: Receiver<()>,
     shutdown_signal: Receiver<()>,
 }
 
@@ -89,6 +91,9 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
 
         let init_view_info = pacemaker.query();
 
+        // Create a channel for local sync hints (e.g., missing-block detection in HotStuff)
+        let (sync_hint_tx, sync_hint_rx) = mpsc::channel();
+
         let hotstuff = HotStuff::new(
             hotstuff_config,
             init_view_info.clone(),
@@ -98,6 +103,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                 .validator_set_state()
                 .expect("Cannot retrieve the validator set state!")
                 .clone(),
+            sync_hint_tx,
             event_publisher.clone(),
         );
 
@@ -117,6 +123,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             hotstuff,
             pacemaker,
             block_sync_client,
+            sync_hint_rx,
             shutdown_signal,
         }
     }
@@ -142,6 +149,13 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                 .tick(&self.block_tree)
                 .expect("Pacemaker failure!");
 
+            // 2b. Apply local sync hints (if any), to catch up immediately when missing blocks are detected.
+            while let Ok(()) = self.sync_hint_rx.try_recv() {
+                let _ = self
+                    .block_sync_client
+                    .trigger_sync(&mut self.block_tree, &mut self.app);
+            }
+
             // 3. Query the pacemaker for potential updates to the current view.
             let view_info = self.pacemaker.query();
 
@@ -154,6 +168,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             }
 
             // 5. Poll the network for incoming messages.
+            // info!("[Debug: algorithm: Poll] Received a message for view: {}", view_info.view);
             match self
                 .pm_stub
                 .recv(self.chain_id, view_info.view, view_info.deadline)
@@ -173,9 +188,12 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                         .expect("Block Sync Client failure!"),
                 },
                 Err(ProgressMessageReceiveError::Disconnected) => {
+                    // info!("[algorithm: Poll] Error: The poller has disconnected!");
                     panic!("The poller has disconnected!")
                 }
-                Err(ProgressMessageReceiveError::Timeout) => {}
+                Err(ProgressMessageReceiveError::Timeout) => {
+                    // info!("[algorithm: Poll] Error: The poller has timed out!");
+                }
             }
 
             // 6. Let the block sync client update its internal state, and trigger sync if needed.

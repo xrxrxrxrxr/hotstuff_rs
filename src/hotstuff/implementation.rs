@@ -12,6 +12,8 @@ use std::{sync::mpsc::Sender, time::SystemTime};
 
 use ed25519_dalek::VerifyingKey;
 
+use log::info;
+
 use crate::{
     app::{
         App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
@@ -74,6 +76,8 @@ pub(crate) struct HotStuff<N: Network> {
     phase_vote_collectors: ActiveCollectorPair<PhaseVoteCollector>,
     sender_handle: SenderHandle<N>,
     validator_set_update_handle: ValidatorSetUpdateHandle<N>,
+    /// Local sync hint channel: used to trigger immediate block sync when missing blocks are detected.
+    sync_hint_tx: Sender<()>,
     event_publisher: Option<Sender<Event>>,
 }
 
@@ -85,6 +89,7 @@ impl<N: Network> HotStuff<N> {
         sender_handle: SenderHandle<N>,
         validator_set_update_handle: ValidatorSetUpdateHandle<N>,
         init_validator_set_state: ValidatorSetState,
+        sync_hint_tx: Sender<()>,
         event_publisher: Option<Sender<Event>>,
     ) -> Self {
         let phase_vote_collectors = <ActiveCollectorPair<PhaseVoteCollector>>::new(
@@ -100,6 +105,7 @@ impl<N: Network> HotStuff<N> {
             phase_vote_collectors,
             sender_handle,
             validator_set_update_handle,
+            sync_hint_tx,
             event_publisher,
         }
     }
@@ -301,16 +307,21 @@ impl<N: Network> HotStuff<N> {
         // 1. If Proposal or Nudge received, check if the sender is a proposer for this view,
         // and check if the replica is still accepting nudges and proposals. If the checks
         // fail, ignore the message.
+        // info!("[implementation: 0.1 Check Message] Received message: for view {}", msg.view());
         if matches!(msg, HotStuffMessage::Proposal(_)) || matches!(msg, HotStuffMessage::Nudge(_)) {
             let validator_set_state = block_tree.validator_set_state()?;
 
             if !is_proposer(origin, self.view_info.view, &validator_set_state) {
+                // info!("[implementation: 0.1 Error] Message sender is not a proposer for view {}", self.view_info.view); 没有error
                 return Ok(());
             }
+
+            // info!("[Debug: implementation: 0.1 Check Message] Message sender is a proposer for view {}", self.view_info.view);
 
             if self.proposal_status.has_one_leader_proposed(origin)
                 || self.proposal_status.have_all_leaders_proposed()
             {
+                // info!("[implementation: 0.1 Error] Leader has already proposed or all leaders have proposed for view {}", self.view_info.view); 没有error
                 return Ok(());
             }
         }
@@ -352,11 +363,12 @@ impl<N: Network> HotStuff<N> {
             proposal: proposal.clone(),
         })
         .publish(&self.event_publisher);
+        
+        // info!("[implementation: 0.2 Check Proposal] Received proposal for view: {}, block: {}",proposal.view, proposal.block.hash);
 
         // 1. Check if block is correct and safe.
-        if !proposal.block.is_correct(block_tree)?
-            || !safe_block(&proposal.block, block_tree, self.config.chain_id)?
-        {
+        if !proposal.block.is_correct(block_tree)? {
+            // info!("[implementation: 0.2.1 Check Block Error] Block {} is not correct",proposal.block.hash);
             // Ensure that proposals or nudges from this leader should no longer be accepted in this view.
             match self.proposal_status {
                 ProposalStatus::WaitingForProposal => {
@@ -370,6 +382,23 @@ impl<N: Network> HotStuff<N> {
             return Ok(());
         }
 
+        if !safe_block(&proposal.block, block_tree, self.config.chain_id)? {
+            // info!("[implementation: 0.2.2 Check Block Error] Block {} is not safe",proposal.block.hash);
+            // Ensure that proposals or nudges from this leader should no longer be accepted in this view.
+            match self.proposal_status {
+                ProposalStatus::WaitingForProposal => {
+                    self.proposal_status = ProposalStatus::OneLeaderProposed { leader: *origin }
+                }
+                ProposalStatus::OneLeaderProposed { leader: _ } => {
+                    self.proposal_status = ProposalStatus::AllLeadersProposed
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        
+        // info!("[implementation: 1. Check Block] block: {} is correct and safe",proposal.block.hash);
+
         // 2. Validate the block using the app, and insert it into the block tree if it is valid.
         let parent_block = if proposal.block.justify.is_genesis_pc() {
             None
@@ -378,12 +407,13 @@ impl<N: Network> HotStuff<N> {
         };
         let validate_block_request =
             ValidateBlockRequest::new(&proposal.block, block_tree.app_view(parent_block)?);
-
+        // info!("[Debug: implementation: 2.1 Prepare to validate Block] block at height: {}", proposal.block.height);
         if let ValidateBlockResponse::Valid {
             app_state_updates,
             validator_set_updates,
         } = app.validate_block(validate_block_request)
         {
+            // info!("[Debug: implementation: 2.2 Validate Block] Validating block at height: {}, view: {}", proposal.block.height, proposal.view);
             block_tree.insert(
                 &proposal.block,
                 app_state_updates.as_ref(),
@@ -435,6 +465,8 @@ impl<N: Network> HotStuff<N> {
                 let vote_recipient = phase_vote_recipient(&phase_vote, &validator_set_state);
                 self.sender_handle
                     .send::<HotStuffMessage>(vote_recipient, phase_vote.clone().into());
+
+                info!("[implementation: Vote] 3. Voting for phase: {:?}", vote_phase);
 
                 block_tree.set_highest_view_phase_voted(self.view_info.view)?;
                 Event::PhaseVote(PhaseVoteEvent {
@@ -595,9 +627,18 @@ impl<N: Network> HotStuff<N> {
                 .publish(&self.event_publisher);
 
                 // If the newly collected PC is not correct or not safe, then ignore it and return.
-                if !new_pc.is_correct(block_tree)?
-                    || !safe_pc(&new_pc, block_tree, self.config.chain_id)?
-                {
+                let is_correct = new_pc.is_correct(block_tree)?;
+                let is_missing_block = !block_tree.contains(&new_pc.block);
+                let is_safe = if is_correct {
+                    safe_pc(&new_pc, block_tree, self.config.chain_id)?
+                } else {
+                    false
+                };
+                if !is_correct || !is_safe {
+                    // If we rejected due to missing block, send a local sync hint.
+                    if is_missing_block {
+                        let _ = self.sync_hint_tx.send(());
+                    }
                     return Ok(());
                 }
 
@@ -642,9 +683,14 @@ impl<N: Network> HotStuff<N> {
         .publish(&self.event_publisher);
 
         // 1. Check if the highest_pc in the NewView message is correct and safe.
-        if new_view.highest_pc.is_correct(block_tree)?
-            && safe_pc(&new_view.highest_pc, block_tree, self.config.chain_id)?
-        {
+        let is_correct = new_view.highest_pc.is_correct(block_tree)?;
+        let is_missing_block = !block_tree.contains(&new_view.highest_pc.block);
+        let is_safe = if is_correct {
+            safe_pc(&new_view.highest_pc, block_tree, self.config.chain_id)?
+        } else {
+            false
+        };
+        if is_correct && is_safe {
             // 2. Trigger block tree updates: update highestPC, lock, commit (if new PC collected).
             let committed_validator_set_updates =
                 block_tree.update(&new_view.highest_pc, &self.event_publisher)?;
@@ -661,6 +707,9 @@ impl<N: Network> HotStuff<N> {
             let _ = self
                 .phase_vote_collectors
                 .update_validator_sets(&validator_set_state);
+        } else if is_missing_block {
+            // Hint the block sync client to catch up now.
+            let _ = self.sync_hint_tx.send(());
         }
 
         Ok(())

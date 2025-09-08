@@ -268,6 +268,16 @@ impl<N: Network> BlockSyncClient<N> {
         }
     }
 
+    /// Immediately trigger a sync attempt with a randomly selected peer.
+    /// Exposes the internal sync for hint-driven catch-up.
+    pub(crate) fn trigger_sync<K: KVStore>(
+        &mut self,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), BlockSyncClientError> {
+        self.sync(block_tree, app)
+    }
+
     /// Sync with a given peer. This involves possibly multiple iterations of:
     /// 1. Sending a sync request to the peer for a given number of blocks,
     /// 2. Waiting for a response from the peer,

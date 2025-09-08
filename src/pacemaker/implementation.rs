@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{VerifyingKey,SigningKey};
 
 use crate::{
     block_tree::{
@@ -71,12 +71,9 @@ impl<N: Network> Pacemaker<N> {
         event_publisher: Option<Sender<Event>>,
     ) -> Result<Self, PacemakerError> {
         let state = PacemakerState::initialize(&config, init_view, init_validator_set_state);
-        let timeout = state
-            .timeouts
-            .get(&init_view)
-            .clone()
-            .ok_or(UpdateViewError::GetViewTimeoutError { view: init_view })?;
-        let view_info = ViewInfo::new(init_view, *timeout);
+        // Use per-view deadline semantics: when starting, give the current view a fresh
+        // deadline of `now + max_view_time` instead of an epoch-anchored cumulative time.
+        let view_info = ViewInfo::new(init_view, Instant::now() + config.max_view_time);
         Ok(Self {
             config,
             state,
@@ -425,14 +422,8 @@ impl<N: Network> Pacemaker<N> {
         }
 
         // 3. Update the Pacemaker's `view_info` state.
-        self.view_info = ViewInfo::new(
-            next_view,
-            *self
-                .state
-                .timeouts
-                .get(&next_view)
-                .ok_or(UpdateViewError::GetViewTimeoutError { view: next_view })?,
-        );
+        // Use per-view deadlines: each time we enter a view, the deadline is `now + max_view_time`.
+        self.view_info = ViewInfo::new(next_view, Instant::now() + self.config.max_view_time);
 
         // 4. Replace our current `timeout_vote_collectors` with new ones for the view we just entered.
         self.state.timeout_vote_collectors = <ActiveCollectorPair<TimeoutVoteCollector>>::new(
@@ -523,10 +514,11 @@ impl PacemakerState {
             let start_time = Instant::now();
 
             // Add timeouts for all remaining views in the epoch of start_view.
+            // Use millisecond precision to avoid truncating sub-second max_view_time to zero seconds.
+            let per_view_ms: u64 = config.max_view_time.as_millis() as u64;
             for view in start_view.int()..=epoch_view {
-                let time_to_view_deadline = Duration::from_secs(
-                    config.max_view_time.as_secs() * (view - start_view.int() + 1),
-                );
+                let n = (view - start_view.int() + 1) as u64;
+                let time_to_view_deadline = Duration::from_millis(per_view_ms.saturating_mul(n));
                 timeouts.insert(ViewNumber::new(view), start_time + time_to_view_deadline);
             }
 
@@ -559,10 +551,11 @@ impl PacemakerState {
         let epoch_start_time = Instant::now();
 
         // Populate `self.timeouts` with the timeouts of the views in the newly-entered epoch.
+        // Use millisecond precision to handle sub-second max_view_time values correctly.
+        let per_view_ms: u64 = config.max_view_time.as_millis() as u64;
         for view in epoch_start_view.int()..=epoch_change_view {
-            let time_to_view_deadline = Duration::from_secs(
-                config.max_view_time.as_secs() * (view - epoch_start_view.int() + 1),
-            );
+            let n = (view - epoch_start_view.int() + 1) as u64;
+            let time_to_view_deadline = Duration::from_millis(per_view_ms.saturating_mul(n));
             self.timeouts.insert(
                 ViewNumber::new(view),
                 epoch_start_time + time_to_view_deadline,
@@ -672,6 +665,17 @@ impl ViewInfo {
 /// [Interleaved WRR](https://en.wikipedia.org/wiki/Weighted_round_robin#Interleaved_WRR) algorithm.
 ///
 /// [Read more](super#leader-selection).
+// pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> VerifyingKey {
+//     let node_id=1;
+//     let secret_bytes: [u8; 32] = [(node_id + 1) as u8; 32];
+//     let signing_key = SigningKey::from_bytes(&secret_bytes);
+//     let my_verifying_key = VerifyingKey::from(signing_key.verifying_key());
+    
+//     return my_verifying_key;
+//     // Safety: If index not found, panic. This should never happen.
+//     // unreachable!("Cannot select a leader: index not found!")
+// }
+
 pub fn select_leader(view: ViewNumber, validator_set: &ValidatorSet) -> VerifyingKey {
     // Length of the abstract array.
     let p_total = validator_set.total_power();

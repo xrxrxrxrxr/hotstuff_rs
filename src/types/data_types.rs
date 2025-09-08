@@ -220,6 +220,12 @@ impl Data {
     }
 }
 
+impl Default for Data {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
 /// Number of [`Datum`] stored in a block's [`Data`].
 #[derive(Clone, Copy, PartialEq, Eq, BorshDeserialize, BorshSerialize)]
 pub struct DataLen(u32);
