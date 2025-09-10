@@ -12,7 +12,7 @@ use std::{sync::mpsc::Sender, time::SystemTime};
 
 use ed25519_dalek::VerifyingKey;
 
-use log::info;
+use log::{info,warn};
 
 use crate::{
     app::{
@@ -237,6 +237,7 @@ impl<N: Network> HotStuff<N> {
                         block_tree.app_view(parent_block.as_ref())?,
                     );
 
+                    warn!("[HotStuff] Producing block for view {}, will call produce_block", self.view_info.view);
                     let ProduceBlockResponse {
                         data,
                         data_hash,

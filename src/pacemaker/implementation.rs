@@ -14,6 +14,7 @@ use std::{
 };
 
 use ed25519_dalek::{VerifyingKey,SigningKey};
+use log::warn;
 
 use crate::{
     block_tree::{
@@ -433,6 +434,7 @@ impl<N: Network> Pacemaker<N> {
         // 3. Update the Pacemaker's `view_info` state.
         // Use per-view deadlines: each time we enter a view, the deadline is `now + max_view_time`.
         self.view_info = ViewInfo::new(next_view, Instant::now() + self.config.max_view_time);
+        warn!("[Ppacemaker] 更新 view = {}",self.view_info.view);
 
         // 4. Replace our current `timeout_vote_collectors` with new ones for the view we just entered.
         self.state.timeout_vote_collectors = <ActiveCollectorPair<TimeoutVoteCollector>>::new(
