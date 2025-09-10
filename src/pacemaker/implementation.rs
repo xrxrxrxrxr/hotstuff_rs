@@ -169,6 +169,15 @@ impl<N: Network> Pacemaker<N> {
             self.state.last_advance_view = Some(self.view_info.view);
         }
 
+        // Aggressive catch-up: if a strictly higher PC exists, fast-forward local view
+        if self.config.aggressive_catchup {
+            let highest_pc_view = block_tree.highest_pc()?.view;
+            if highest_pc_view > cur_view {
+                // Fast-forward in one step to the highest PC view
+                self.update_view(highest_pc_view, &validator_set_state)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -480,6 +489,8 @@ pub(crate) struct PacemakerConfiguration {
 
     /// How much time can elapse in a view before it times out.
     pub(crate) max_view_time: Duration,
+    /// When enabled, fast-forward local view to `highest_pc.view` during tick.
+    pub(crate) aggressive_catchup: bool,
 }
 
 /// In-memory state of a [`Pacemaker`].

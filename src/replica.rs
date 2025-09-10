@@ -271,6 +271,10 @@ impl
             keypair: keypair.clone(),
             epoch_length: self.epoch_length,
             max_view_time: self.max_view_time,
+            aggressive_catchup: std::env::var("HS_AGGRESSIVE_CATCHUP")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         };
         let block_sync_client_config = BlockSyncClientConfiguration {
             chain_id: self.chain_id,
