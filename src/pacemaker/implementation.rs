@@ -9,7 +9,7 @@
 
 use std::{
     collections::BTreeMap,
-    sync::mpsc::Sender,
+    sync::mpsc::{Sender, Receiver},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -39,6 +39,13 @@ use crate::{
     },
 };
 
+// Add this definition or import for SystemEvent if not already present:
+#[derive(Debug, Clone)]
+pub enum SystemEvent {
+    SyncPacemakerView { new_view: u64 },
+    // ... other variants as needed ...
+}
+
 /// A single participant in the Pacemaker subprotocol.
 ///
 /// # Usage
@@ -60,6 +67,7 @@ pub(crate) struct Pacemaker<N: Network> {
     view_info: ViewInfo,
     sender: SenderHandle<N>,
     event_publisher: Option<Sender<Event>>,
+    event_receiver: Receiver<SystemEvent>, 
 }
 
 impl<N: Network> Pacemaker<N> {
@@ -70,6 +78,7 @@ impl<N: Network> Pacemaker<N> {
         init_view: ViewNumber,
         init_validator_set_state: &ValidatorSetState,
         event_publisher: Option<Sender<Event>>,
+        event_receiver: Receiver<SystemEvent>, 
     ) -> Result<Self, PacemakerError> {
         let state = PacemakerState::initialize(&config, init_view, init_validator_set_state);
         // Use per-view deadline semantics: when starting, give the current view a fresh
@@ -81,6 +90,7 @@ impl<N: Network> Pacemaker<N> {
             view_info,
             sender,
             event_publisher,
+            event_receiver,
         })
     }
 
@@ -126,13 +136,11 @@ impl<N: Network> Pacemaker<N> {
                     }
                 }
 
-                // We extend the view timeout so that we will broadcast a `TimeoutVote` when this view times out again.
-                self.extend_view()?
-
+                // 去掉：self.extend_view()?;  // 不再独立推进 view
             // 1.2. Else, if the current view is not a normal view, simply update the Pacemaker instance's local
             // view the next view.
             } else {
-                self.update_view(cur_view + 1, &validator_set_state)?;
+                // 去掉：self.update_view(cur_view + 1, &validator_set_state)?;  // 不再独立推进 view
             }
 
             return Ok(());
@@ -170,14 +178,20 @@ impl<N: Network> Pacemaker<N> {
             self.state.last_advance_view = Some(self.view_info.view);
         }
 
-        // Aggressive catch-up: if a strictly higher PC exists, fast-forward local view
-        if self.config.aggressive_catchup {
-            let highest_pc_view = block_tree.highest_pc()?.view;
-            if highest_pc_view > cur_view {
-                // Fast-forward in one step to the highest PC view
-                self.update_view(highest_pc_view, &validator_set_state)?;
+        // 新增：监听 SyncPacemakerView 事件并更新 view
+        if let Ok(event) = self.event_receiver.try_recv() {  // 正确处理 Result
+            match event {
+                SystemEvent::SyncPacemakerView { new_view } => {
+                    let validator_set_state = block_tree.validator_set_state()?;
+                    self.update_view(ViewNumber::new(new_view), &validator_set_state)?;
+                    warn!("[Pacemaker] 同步 view 到 {}", new_view);
+                }
+                // ... 其他事件 ...
             }
         }
+
+        // 去掉独立 view 更新逻辑
+        // if self.config.aggressive_catchup { ... }
 
         Ok(())
     }
@@ -310,9 +324,9 @@ impl<N: Network> Pacemaker<N> {
                     })
                     .publish(&self.event_publisher);
 
-                    // Check if about to enter a new epoch, and if so then set the timeouts for the new epoch.
-                    let next_view = tc.view + 1;
-                    self.update_view(next_view, &validator_set_state)?
+                    // 超时推进：根据 TC 直接进入 tc.view + 1（允许在 PC 未前进时也能换领导推进）。
+                    // let next_view = tc.view + 1;
+                    // self.update_view(next_view, &validator_set_state)?  // 不再独立推进 view
                 }
             }
         }
@@ -395,9 +409,9 @@ impl<N: Network> Pacemaker<N> {
                 self.state.last_advance_view = Some(self.view_info.view);
             }
 
-            // 5. Check if about to enter a new epoch, and if so then set the timeouts for the new epoch.
-            let next_view = progress_certificate.view() + 1;
-            self.update_view(next_view, &validator_set_state)?
+            // 5. 根据收到的进度证书进入下一视图（PC/TC 均可）。
+            // let next_view = progress_certificate.view() + 1;
+            // self.update_view(next_view, &validator_set_state)?
         }
 
         Ok(())

@@ -559,6 +559,7 @@ impl<K: KVStore, A: App<K> + 'static, N: Network + 'static> ReplicaSpec<K, A, N>
 
 /// A handle to the background threads of a HotStuff-rs replica. When this value is dropped, all
 /// background threads are gracefully shut down.
+/// #[derive(Clone)]
 pub struct Replica<K: KVStore> {
     block_tree_camera: BlockTreeCamera<K>,
     poller: Option<JoinHandle<()>>,

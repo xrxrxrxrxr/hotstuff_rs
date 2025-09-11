@@ -187,7 +187,7 @@ pub struct ProduceBlockRequest<'a, K: KVStore> {
 
 impl<'a, K: KVStore> ProduceBlockRequest<'a, K> {
     /// Create a new `ProduceBlockRequest`.
-    pub(crate) fn new(
+    pub fn new(
         cur_view: ViewNumber,
         parent_block: Option<CryptoHash>,
         block_tree_view: AppBlockTreeView<'a, K>,

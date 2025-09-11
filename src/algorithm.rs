@@ -11,8 +11,11 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+
+
 use ed25519_dalek::VerifyingKey;
 use log::info;
+// use tokio::sync::mpsc;  // 导入 tokio mpsc 用于异步通道
 
 use crate::{
     app::App,
@@ -29,7 +32,7 @@ use crate::{
         receiving::{BlockSyncClientStub, ProgressMessageReceiveError, ProgressMessageStub},
         sending::SenderHandle,
     },
-    pacemaker::implementation::{Pacemaker, PacemakerConfiguration},
+    pacemaker::implementation::{Pacemaker, PacemakerConfiguration,SystemEvent},
     types::data_types::{BufferSize, ChainID, ViewNumber},
 };
 
@@ -46,6 +49,7 @@ pub(crate) struct Algorithm<N: Network + 'static, K: KVStore, A: App<K> + 'stati
     block_sync_client: BlockSyncClient<N>,
     sync_hint_rx: Receiver<()>,
     shutdown_signal: Receiver<()>,
+    event_tx: Sender<SystemEvent>,  // 新增：保存 event_tx 用于发送事件
 }
 
 impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
@@ -78,6 +82,9 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             v => ViewNumber::new(v + 1),
         };
 
+        // 新增：创建事件通道用于 pacemaker 同步
+        let (event_tx, event_rx) = mpsc::channel();  // event_tx 用于发送，event_rx 用于接收
+
         let pacemaker = Pacemaker::new(
             pacemaker_config,
             msg_sender.clone(),
@@ -86,6 +93,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                 .validator_set_state()
                 .expect("Cannot retrieve the validator set state!"),
             event_publisher.clone(),
+            event_rx,  // 新增：传入 event_receiver
         )
         .expect("Failed to create a new Pacemaker!");
 
@@ -125,6 +133,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             block_sync_client,
             sync_hint_rx,
             shutdown_signal,
+            event_tx,  // 新增：保存 event_tx 用于发送事件
         }
     }
 
